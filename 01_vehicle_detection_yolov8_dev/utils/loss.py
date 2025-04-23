@@ -68,7 +68,8 @@ class YOLOv8Loss(nn.Module):
     def cls_loss(self, pred: torch.Tensor, target: torch.Tensor, obj_mask: torch.Tensor) -> torch.Tensor:
         """Calculate classification loss."""
         # Only calculate loss for cells with objects
-        loss = self.bce(pred, target) * obj_mask
+        target = self.to_one_hot(target, self.num_classes)
+        loss = self.bce(pred, target) * obj_mask 
         return loss.mean()
 
     @staticmethod
@@ -93,6 +94,29 @@ class YOLOv8Loss(nn.Module):
         
         # Calculate IoU
         return inter_area / (union_area + 1e-7)
+
+    @staticmethod
+    def to_one_hot(target: torch.Tensor, num_classes: int) -> torch.Tensor:
+        """
+        Convert class targets to one-hot encoding.
+        
+        Args:
+            target: Tensor of shape [B, A, 1, H, W] containing class indices
+            num_classes: Number of classes
+            
+        Returns:
+            Tensor of shape [B, A, num_classes, H, W] containing one-hot encoding
+        """
+        # Remove singleton dimension and convert to long
+        target = target.squeeze(2).long()  # [B, A, H, W]
+        
+        # Create one-hot encoding
+        one_hot = F.one_hot(target, num_classes)  # [B, A, H, W, num_classes]
+        
+        # Move num_classes dimension to the right position
+        one_hot = one_hot.permute(0, 1, 4, 2, 3)  # [B, A, num_classes, H, W]
+        
+        return one_hot.float()
 
 class DistributionFocalLoss(nn.Module):
     """
@@ -121,40 +145,68 @@ class DistributionFocalLoss(nn.Module):
         Calculate DFL loss.
         
         Args:
-            pred: Predicted distribution [B, 3, 4, reg_max, H, W]
-            target: Target values [B, 3, 4, H, W]
-            obj_mask: Object presence mask [B, 3, 1, H, W]
+            pred: Predicted distribution [B, A, 4, H, W]
+            target: Target values [B, A, 4, H, W] (relative coordinates in [0,1])
+            obj_mask: Object presence mask [B, A, 1, H, W]
             
         Returns:
             torch.Tensor: DFL loss
         """
+        B, A, _, H, W = pred.shape
+        
+        # Scale predictions and targets to [0, reg_max-1] range
+        pred = pred * (self.reg_max - 1)  # [B, A, 4, H, W]
+        target = target * (self.reg_max - 1)  # [B, A, 4, H, W]
+        
+        # Clamp values to valid range
+        pred = torch.clamp(pred, 0, self.reg_max - 1)
+        target = torch.clamp(target, 0, self.reg_max - 1)
+        
+        # Get integer and fractional parts
+        pred_int = pred.floor()  # [B, A, 4, H, W]
+        pred_frac = pred - pred_int  # [B, A, 4, H, W]
+        
+        # Handle edge case where pred_int is reg_max-1
+        pred_int = torch.clamp(pred_int, 0, self.reg_max - 2)  # Ensure room for right bin
+        pred_right = torch.clamp(pred_int + 1, 0, self.reg_max - 1)
+        
+        # Create prediction distribution
+        pred_dist = torch.zeros(B, A, 4, self.reg_max, H, W, device=pred.device)  # [B, A, 4, reg_max, H, W]
+        
+        # Set values for left and right bins
+        pred_dist.scatter_(3, pred_int.long().unsqueeze(3), pred_frac.unsqueeze(3))  # Left bin
+        pred_dist.scatter_(3, pred_right.long().unsqueeze(3), (1 - pred_frac).unsqueeze(3))  # Right bin
+        
+        # Get integer and fractional parts of targets
+        target_int = target.floor()  # [B, A, 4, H, W]
+        target_frac = target - target_int  # [B, A, 4, H, W]
+        
+        # Handle edge case where target_int is reg_max-1
+        target_int = torch.clamp(target_int, 0, self.reg_max - 2)  # Ensure room for right bin
+        target_right = torch.clamp(target_int + 1, 0, self.reg_max - 1)
+        
         # Create target distribution
-        target = target.unsqueeze(-2)  # [B, 3, 4, 1, H, W]
-        target_left = target.floor()
-        target_right = target_left + 1
+        target_dist = torch.zeros(B, A, 4, self.reg_max, H, W, device=target.device)  # [B, A, 4, reg_max, H, W]
         
-        # Calculate weights for left and right values
-        weight_right = target - target_left
-        weight_left = 1 - weight_right
+        # Set values for left and right bins
+        target_dist.scatter_(3, target_int.long().unsqueeze(3), target_frac.unsqueeze(3))  # Left bin
+        target_dist.scatter_(3, target_right.long().unsqueeze(3), (1 - target_frac).unsqueeze(3))  # Right bin
         
-        # Create one-hot targets
-        target_left = target_left.long()
-        target_right = target_right.long()
-        
-        # Create target distributions
-        target_dist_left = F.one_hot(target_left, self.reg_max)
-        target_dist_right = F.one_hot(target_right, self.reg_max)
-        
-        # Calculate losses
+        # Calculate loss
         if self.use_sigmoid:
-            pred = pred.sigmoid()
+            pred_dist = pred_dist.sigmoid()
         
-        loss_left = self.bce(pred, target_dist_left) * weight_left
-        loss_right = self.bce(pred, target_dist_right) * weight_right
+        # Calculate BCE loss between distributions
+        loss = self.bce(pred_dist, target_dist)  # [B, A, 4, reg_max, H, W]
         
-        # Combine losses and apply object mask
-        loss = (loss_left + loss_right).mean(dim=-1)  # [B, 3, 4, H, W]
-        loss = loss * obj_mask.squeeze(-2)
+        # Average over reg_max dimension
+        loss = loss.mean(dim=3)  # [B, A, 4, H, W]
+        
+        # Apply object mask
+        obj_mask = obj_mask.squeeze(-3)  # Remove singleton dimension from [B, A, 1, H, W] to [B, A, H, W]
+        obj_mask = obj_mask.unsqueeze(2)  # Add coordinate dimension [B, A, 1, H, W]
+        obj_mask = obj_mask.expand(-1, -1, 4, -1, -1)  # Expand to match loss shape [B, A, 4, H, W]
+        loss = loss * obj_mask
         
         return loss.mean()
 

@@ -35,9 +35,9 @@ def test_yolov8_loss():
                 # Set object presence
                 target[b, a*6+4, y, x] = 1.0
                 # Set random box coordinates
-                target[b, a*6:a*6+4, y, x] = torch.rand(4)
+                target[b, a*6:a*6+4, y, x] = torch.rand(4,1)
                 # Set random class
-                target[b, a*6+5, y, x] = torch.randint(0, num_classes, (1,))
+                target[b, a*6+5, y, x] = torch.randint(0, num_classes, (1,)).float()
         
         targets.append(target)
     
