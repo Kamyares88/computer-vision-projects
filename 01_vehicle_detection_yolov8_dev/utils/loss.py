@@ -146,7 +146,7 @@ class DistributionFocalLoss(nn.Module):
         
         Args:
             pred: Predicted distribution [B, A, 4, H, W]
-            target: Target values [B, A, 4, H, W] (relative coordinates in [0,1])
+            target: Target values [B, A, 4, H, W] (relative coordinates in [0,1])s
             obj_mask: Object presence mask [B, A, 1, H, W]
             
         Returns:
